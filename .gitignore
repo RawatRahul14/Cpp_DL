@@ -1,0 +1,7 @@
+build/
+.venv/
+__pycache__/
+*.pyc
+artifacts/
+data/winequality-red.csv
+wine_engine*.pyd
