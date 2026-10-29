@@ -1,4 +1,5 @@
 #include "wine_model.h"
+
 #include <algorithm>
 #include <cmath>
 #include <fstream>
@@ -8,91 +9,377 @@
 #include <stdexcept>
 
 namespace {
-constexpr int F = 11;
-struct Data { std::vector<std::vector<double>> x; std::vector<double> y; };
 
+// Number of input physicochemical features in the UCI Wine Quality dataset
+constexpr int kNumFeatures = 11;
+
+/**
+ * @brief Internal container for parsed raw CSV observations.
+ */
+struct Data {
+    std::vector<std::vector<double>> x; // 2D feature matrix [N][11]
+    std::vector<double> y; // 1D target vector [N]
+};
+
+/**
+ * @brief Parses the semicolon-delimited UCI Wine Quality CSV file.
+ */
 Data read_csv(const std::string& path) {
-  std::ifstream in(path);
-  if (!in) throw std::runtime_error("Cannot open CSV: " + path);
-  std::string line; std::getline(in, line);
-  Data d;
-  while (std::getline(in, line)) {
-    if (line.empty()) continue;
-    std::stringstream ss(line); std::string cell; std::vector<double> v;
-    while (std::getline(ss, cell, ';')) v.push_back(std::stod(cell));
-    if (v.size() != 12) throw std::runtime_error("Expected 11 features + quality target; use UCI red-wine CSV.");
-    d.x.emplace_back(v.begin(), v.begin()+F); d.y.push_back(v.back());
-  }
-  if (d.x.size() < 20) throw std::runtime_error("Too few CSV rows.");
-  return d;
-}
-torch::Tensor make_x(const Data& d, const std::vector<size_t>& ids,
-                     const std::vector<double>& mu, const std::vector<double>& sd) {
-  std::vector<float> a; a.reserve(ids.size()*F);
-  for (auto i: ids) for(int j=0;j<F;++j) a.push_back(float((d.x[i][j]-mu[j])/sd[j]));
-  return torch::from_blob(a.data(), {long(ids.size()),F}, torch::kFloat32).clone();
-}
-torch::Tensor make_y(const Data& d, const std::vector<size_t>& ids) {
-  std::vector<float> a; a.reserve(ids.size());
-  for(auto i:ids) a.push_back(float(d.y[i]));
-  return torch::from_blob(a.data(), {long(ids.size()),1}, torch::kFloat32).clone();
-}
-void save_scaler(const std::string& p,const std::vector<double>& m,const std::vector<double>& s) {
-  std::ofstream o(p); if(!o) throw std::runtime_error("Cannot write scaler file.");
-  o<<"wine_scaler_v1\n";
-  for(int j=0;j<F;++j)o<<m[j]<<(j+1==F?'\n':',');
-  for(int j=0;j<F;++j)o<<s[j]<<(j+1==F?'\n':',');
-}
-void load_scaler(const std::string& p,std::vector<double>& m,std::vector<double>& s) {
-  std::ifstream in(p); if(!in)throw std::runtime_error("Cannot open scaler file.");
-  std::string line; std::getline(in,line); if(line!="wine_scaler_v1")throw std::runtime_error("Invalid scaler version.");
-  for(int pass=0;pass<2;++pass) {
-    if(!std::getline(in,line))throw std::runtime_error("Scaler file incomplete.");
-    std::stringstream ss(line);std::string cell;std::vector<double> v;
-    while(std::getline(ss,cell,','))v.push_back(std::stod(cell));
-    if(v.size()!=F)throw std::runtime_error("Scaler must contain 11 values.");
-    (pass==0?m:s)=v;
-  }
-}
-}
-WineRegressorImpl::WineRegressorImpl() {
-  network=register_module("network",torch::nn::Sequential(
-    torch::nn::Linear(F,32),torch::nn::ReLU(),
-    torch::nn::Linear(32,16),torch::nn::ReLU(),torch::nn::Linear(16,1)));
-}
-torch::Tensor WineRegressorImpl::forward(torch::Tensor x){return network->forward(x);}
+    std::ifstream in(path);
+    if (!in) {
+        throw std::runtime_error("Cannot open CSV: " + path);
+    }
 
-TrainResult train_csv(const std::string& csv,const std::string& model_path,
-                      const std::string& scaler_path,int epochs,int seed) {
-  if(epochs<1||epochs>10000)throw std::runtime_error("epochs must be 1..10000");
-  torch::manual_seed(seed); auto d=read_csv(csv);
-  std::vector<size_t> ids(d.x.size());std::iota(ids.begin(),ids.end(),0);
-  std::mt19937 rng(unsigned(seed));std::shuffle(ids.begin(),ids.end(),rng);
-  size_t n=size_t(d.x.size()*0.8);
-  std::vector<size_t> tr(ids.begin(),ids.begin()+n),te(ids.begin()+n,ids.end());
-  std::vector<double> mu(F,0),sd(F,0);
-  for(auto i:tr)for(int j=0;j<F;++j)mu[j]+=d.x[i][j];
-  for(auto& v:mu)v/=double(tr.size());
-  for(auto i:tr)for(int j=0;j<F;++j){double z=d.x[i][j]-mu[j];sd[j]+=z*z;}
-  for(auto& v:sd){v=std::sqrt(v/double(tr.size()));if(v<1e-12)v=1;}
-  save_scaler(scaler_path,mu,sd);
-  auto xt=make_x(d,tr,mu,sd),yt=make_y(d,tr),xv=make_x(d,te,mu,sd),yv=make_y(d,te);
-  WineRegressor net; torch::optim::Adam opt(net->parameters(),torch::optim::AdamOptions(0.003));
-  double loss_value=0;
-  for(int e=0;e<epochs;++e){net->train();opt.zero_grad();auto p=net->forward(xt);
-    auto loss=torch::mse_loss(p,yt);loss.backward();opt.step();loss_value=loss.item<double>();}
-  net->eval();torch::NoGradGuard ng;auto p=net->forward(xv).reshape({-1}), y=yv.reshape({-1});
-  double mae=torch::l1_loss(p,y).item<double>(),rmse=std::sqrt(torch::mse_loss(p,y).item<double>());
-  double mean=y.mean().item<double>(),tot=((y-mean)*(y-mean)).sum().item<double>();
-  double res=((y-p)*(y-p)).sum().item<double>(),r2=tot>1e-12?1-res/tot:0;
-  torch::save(net,model_path);
-  return {mae,rmse,r2,loss_value,int(tr.size()),int(te.size())};
+    // Skip the header row
+    std::string line;
+    std::getline(in, line);
+
+    Data data;
+    while (std::getline(in, line)) {
+        if (line.empty()) {
+            continue;
+        }
+
+        std::stringstream ss(line);
+        std::string cell;
+        std::vector<double> row_values;
+
+        // Parse semicolon-separated floats
+        while (std::getline(ss, cell, ';')) {
+            row_values.push_back(std::stod(cell));
+        }
+
+        // Expect 11 input features + 1 target column = 12 columns total
+        if (row_values.size() != 12) {
+            throw std::runtime_error(
+                "Expected 11 features + quality target; use UCI red-wine CSV."
+            );
+        }
+
+        data.x.emplace_back(row_values.begin(), row_values.begin() + kNumFeatures);
+        data.y.push_back(row_values.back());
+    }
+
+    if (data.x.size() < 20) {
+        throw std::runtime_error("Too few CSV rows to perform a valid split.");
+    }
+
+    return data;
 }
-std::vector<double> predict_one(const std::vector<double>& f,const std::string& model_path,const std::string& scaler_path) {
-  if(f.size()!=F)throw std::runtime_error("Exactly 11 features are required.");
-  std::vector<double> m,s;load_scaler(scaler_path,m,s);std::vector<float> z;
-  for(int j=0;j<F;++j)z.push_back(float((f[j]-m[j])/s[j]));
-  auto x=torch::from_blob(z.data(),{1,F},torch::kFloat32).clone();
-  WineRegressor net;torch::load(net,model_path);net->eval();torch::NoGradGuard ng;
-  return {net->forward(x).item<double>()};
+
+/**
+ * @brief Converts indexed subset of features into a standardized 2D Float32 Tensor.
+ * 
+ * Standardization formula: z = (x - mu) / sd
+ * 
+ * IMPORTANT: `torch::from_blob` does not take ownership of the underlying `std::vector`
+ * buffer. Calling `.clone()` allocates a new LibTorch-managed memory buffer before
+ * `flat_buffer` goes out of scope.
+ */
+torch::Tensor make_x(
+    const Data& data,
+    const std::vector<size_t>& indices,
+    const std::vector<double>& mu,
+    const std::vector<double>& sd
+) {
+    std::vector<float> flat_buffer;
+    flat_buffer.reserve(indices.size() * kNumFeatures);
+
+    for (size_t row_idx : indices) {
+        for (int col_idx = 0; col_idx < kNumFeatures; ++col_idx) {
+            double standardized = (data.x[row_idx][col_idx] - mu[col_idx]) / sd[col_idx];
+            flat_buffer.push_back(static_cast<float>(standardized));
+        }
+    }
+
+    auto tensor_view = torch::from_blob(
+        flat_buffer.data(),
+        {static_cast<long>(indices.size()), kNumFeatures},
+        torch::kFloat32
+    );
+
+    return tensor_view.clone();
+}
+
+/**
+ * @brief Converts indexed subset of target values into a 2D Float32 column Tensor [N, 1].
+ */
+torch::Tensor make_y(const Data& data, const std::vector<size_t>& indices) {
+    std::vector<float> flat_buffer;
+    flat_buffer.reserve(indices.size());
+
+    for (size_t row_idx : indices) {
+        flat_buffer.push_back(static_cast<float>(data.y[row_idx]));
+    }
+
+    auto tensor_view = torch::from_blob(
+        flat_buffer.data(),
+        {static_cast<long>(indices.size()), 1},
+        torch::kFloat32
+    );
+
+    return tensor_view.clone();
+}
+
+/**
+ * @brief Serializes the training set feature means and standard deviations to disk.
+ * 
+ * Format:
+ * Line 1: wine_scaler_v1 (version header)
+ * Line 2: comma-separated means (11 values)
+ * Line 3: comma-separated standard deviations (11 values)
+ */
+void save_scaler(
+    const std::string& path,
+    const std::vector<double>& mean,
+    const std::vector<double>& std_dev
+) {
+    std::ofstream out(path);
+    if (!out) {
+        throw std::runtime_error("Cannot write scaler file: " + path);
+    }
+
+    out << "wine_scaler_v1\n";
+
+    for (int j = 0; j < kNumFeatures; ++j) {
+        out << mean[j] << (j + 1 == kNumFeatures ? '\n' : ',');
+    }
+
+    for (int j = 0; j < kNumFeatures; ++j) {
+        out << std_dev[j] << (j + 1 == kNumFeatures ? '\n' : ',');
+    }
+}
+
+/**
+ * @brief Deserializes feature means and standard deviations from disk for inference.
+ */
+void load_scaler(
+    const std::string& path,
+    std::vector<double>& mean,
+    std::vector<double>& std_dev
+) {
+    std::ifstream in(path);
+    if (!in) {
+        throw std::runtime_error("Cannot open scaler file: " + path);
+    }
+
+    std::string line;
+    std::getline(in, line);
+    if (line != "wine_scaler_v1") {
+        throw std::runtime_error("Invalid scaler version header.");
+    }
+
+    // Pass 0 reads means; Pass 1 reads standard deviations
+    for (int pass = 0; pass < 2; ++pass) {
+        if (!std::getline(in, line)) {
+            throw std::runtime_error("Scaler file incomplete.");
+        }
+
+        std::stringstream ss(line);
+        std::string cell;
+        std::vector<double> values;
+
+        while (std::getline(ss, cell, ',')) {
+            values.push_back(std::stod(cell));
+        }
+
+        if (values.size() != kNumFeatures) {
+            throw std::runtime_error("Scaler must contain exactly 11 values per row.");
+        }
+
+        if (pass == 0) {
+            mean = std::move(values);
+        } else {
+            std::move(values.begin(), values.end(), std::back_inserter(std_dev));
+            std_dev = values;
+        }
+    }
+}
+
+} // anonymous namespace
+
+// ==============================================================================
+// Model Implementation
+// ==============================================================================
+
+WineRegressorImpl::WineRegressorImpl() {
+    network = register_module(
+        "network",
+        torch::nn::Sequential(
+            torch::nn::Linear(kNumFeatures, 32),
+            torch::nn::ReLU(),
+            torch::nn::Linear(32, 16),
+            torch::nn::ReLU(),
+            torch::nn::Linear(16, 1)
+        )
+    );
+}
+
+torch::Tensor WineRegressorImpl::forward(torch::Tensor x) {
+    return network->forward(x);
+}
+
+// ==============================================================================
+// Training & Evaluation Pipeline
+// ==============================================================================
+
+TrainResult train_csv(
+    const std::string& csv_path,
+    const std::string& model_path,
+    const std::string& scaler_path,
+    int epochs,
+    int seed
+) {
+    if (epochs < 1 || epochs > 10000) {
+        throw std::runtime_error("epochs must be between 1 and 10000.");
+    }
+
+    // 1. Set LibTorch PRNG seed for reproducible weight initialization
+    torch::manual_seed(seed);
+
+    // 2. Load raw CSV data
+    Data data = read_csv(csv_path);
+
+    // 3. Generate deterministic 80/20 Train/Test split indices
+    std::vector<size_t> indices(data.x.size());
+    std::iota(indices.begin(), indices.end(), 0);
+
+    std::mt19937 rng(static_cast<unsigned int>(seed));
+    std::shuffle(indices.begin(), indices.end(), rng);
+
+    size_t train_count = static_cast<size_t>(data.x.size() * 0.8);
+    std::vector<size_t> train_idx(indices.begin(), indices.begin() + train_count);
+    std::vector<size_t> test_idx(indices.begin() + train_count, indices.end());
+
+    // 4. Compute Z-score scaler parameters STRICTLY on the training split (prevents test-set data leakage into training normalization)
+    std::vector<double> mu(kNumFeatures, 0.0);
+    std::vector<double> sd(kNumFeatures, 0.0);
+
+    for (size_t row_idx : train_idx) {
+        for (int j = 0; j < kNumFeatures; ++j) {
+            mu[j] += data.x[row_idx][j];
+        }
+    }
+    for (double& val : mu) {
+        val /= static_cast<double>(train_idx.size());
+    }
+
+    for (size_t row_idx : train_idx) {
+        for (int j = 0; j < kNumFeatures; ++j) {
+            double diff = data.x[row_idx][j] - mu[j];
+            sd[j] += diff * diff;
+        }
+    }
+    for (double& val : sd) {
+        val = std::sqrt(val / static_cast<double>(train_idx.size()));
+        // Guard against division by zero for constant features
+        if (val < 1e-12) {
+            val = 1.0;
+        }
+    }
+
+    // Persist scaler parameters for future single-sample inference
+    save_scaler(scaler_path, mu, sd);
+
+    // 5. Build standardized LibTorch tensors for training and validation
+    torch::Tensor x_train = make_x(data, train_idx, mu, sd);
+    torch::Tensor y_train = make_y(data, train_idx);
+    torch::Tensor x_test  = make_x(data, test_idx, mu, sd);
+    torch::Tensor y_test  = make_y(data, test_idx);
+
+    // 6. Initialize model and Adam optimizer (learning rate = 3e-3)
+    WineRegressor net;
+    torch::optim::Adam optimizer(
+        net->parameters(),
+        torch::optim::AdamOptions(0.003)
+    );
+
+    // 7. Full-batch training loop
+    double final_train_loss = 0.0;
+    for (int epoch = 0; epoch < epochs; ++epoch) {
+        net->train();
+        optimizer.zero_grad();
+
+        torch::Tensor predictions = net->forward(x_train);
+        torch::Tensor loss = torch::mse_loss(predictions, y_train);
+
+        loss.backward();
+        optimizer.step();
+
+        final_train_loss = loss.item<double>();
+    }
+
+    // 8. Out-of-sample evaluation on the held-out 20% test split
+    net->eval();
+    torch::NoGradGuard no_grad; // Disable autograd graph construction
+
+    torch::Tensor preds_1d = net->forward(x_test).reshape({-1});
+    torch::Tensor targets_1d = y_test.reshape({-1});
+
+    // Compute MAE and RMSE
+    double mae = torch::l1_loss(preds_1d, targets_1d).item<double>();
+    double mse = torch::mse_loss(preds_1d, targets_1d).item<double>();
+    double rmse = std::sqrt(mse);
+
+    // Compute R^2 = 1 - (SS_res / SS_tot)
+    double y_mean = targets_1d.mean().item<double>();
+    double ss_tot = ((targets_1d - y_mean) * (targets_1d - y_mean)).sum().item<double>();
+    double ss_res = ((targets_1d - preds_1d) * (targets_1d - preds_1d)).sum().item<double>();
+    double r2 = (ss_tot > 1e-12) ? (1.0 - (ss_res / ss_tot)) : 0.0;
+
+    // 9. Serialize trained model parameters to disk
+    torch::save(net, model_path);
+
+    return TrainResult{
+        mae,
+        rmse,
+        r2,
+        final_train_loss,
+        static_cast<int>(train_idx.size()),
+        static_cast<int>(test_idx.size())
+    };
+}
+
+// ==============================================================================
+// Single-Sample Inference
+// ==============================================================================
+
+std::vector<double> predict_one(
+    const std::vector<double>& features,
+    const std::string& model_path,
+    const std::string& scaler_path
+) {
+    if (features.size() != kNumFeatures) {
+        throw std::runtime_error("Exactly 11 features are required for inference.");
+    }
+
+    // 1. Load saved standardization parameters
+    std::vector<double> mu;
+    std::vector<double> sd;
+    load_scaler(scaler_path, mu, sd);
+
+    // 2. Standardize raw input vector
+    std::vector<float> standardized_features;
+    standardized_features.reserve(kNumFeatures);
+    for (int j = 0; j < kNumFeatures; ++j) {
+        double z = (features[j] - mu[j]) / sd[j];
+        standardized_features.push_back(static_cast<float>(z));
+    }
+
+    // 3. Construct [1, 11] input tensor
+    torch::Tensor x_input = torch::from_blob(
+        standardized_features.data(),
+        {1, kNumFeatures},
+        torch::kFloat32
+    ).clone();
+
+    // 4. Load serialized model weights and run forward pass
+    WineRegressor net;
+    torch::load(net, model_path);
+    net->eval();
+
+    torch::NoGradGuard no_grad;
+    double prediction = net->forward(x_input).item<double>();
+
+    return {prediction};
 }
